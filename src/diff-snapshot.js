@@ -15,12 +15,16 @@
 const childProcess = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { promisify } = require('util');
+const { Readable } = require('stream');
 const mkdirp = require('mkdirp');
 const pixelmatch = require('pixelmatch');
 const { PNG } = require('pngjs');
 const rimraf = require('rimraf');
 const { createHash } = require('crypto');
 const glur = require('glur');
+const { yieldish } = require('yieldish');
+const getStream = require('get-stream');
 const ImageComposer = require('./image-composer');
 
 /**
@@ -84,8 +88,8 @@ const shouldUpdate = ({ pass, updateSnapshot, updatePassedSnapshot }) => (
   (!pass && updateSnapshot) || (pass && updatePassedSnapshot)
 );
 
-function diffImageToSnapshot(options) {
-  /* eslint complexity: ["error", 12] */
+// eslint-disable-next-line complexity
+const diffImageToSnapshot = yieldish(isSync => function* fn(options) {
   const {
     receivedImageBuffer,
     snapshotIdentifier,
@@ -100,15 +104,30 @@ function diffImageToSnapshot(options) {
     blur,
   } = options;
 
+  /* istanbul ignore next */
+  const existsFn = isSync ? fs.existsSync : promisify(fs.exists);
+  /* istanbul ignore next */
+  const mkdirpFn = isSync ? mkdirp.sync : promisify(mkdirp);
+  /* istanbul ignore next */
+  const writeFileFn = isSync ? fs.writeFileSync : promisify(fs.writeFile);
+  /* istanbul ignore next */
+  const rimrafFn = isSync ? rimraf.sync : promisify(rimraf);
+  /* istanbul ignore next */
+  const pngReadFn = isSync ? PNG.sync.read : promisify(PNG.read);
+  /* istanbul ignore next */
+  const readFileFn = isSync ? fs.readFileSync : promisify(fs.readFile);
+  /* istanbul ignore next */
+  const pngWriteFn = isSync ? PNG.sync.write : promisify(PNG.write);
+
   let result = {};
   const baselineSnapshotPath = path.join(snapshotsDir, `${snapshotIdentifier}-snap.png`);
-  if (!fs.existsSync(baselineSnapshotPath)) {
-    mkdirp.sync(snapshotsDir);
-    fs.writeFileSync(baselineSnapshotPath, receivedImageBuffer);
+  if (!(yield existsFn(baselineSnapshotPath))) {
+    yield mkdirpFn(snapshotsDir);
+    yield writeFileFn(baselineSnapshotPath, receivedImageBuffer);
     result = { added: true };
   } else {
     const diffOutputPath = path.join(diffDir, `${snapshotIdentifier}-diff.png`);
-    rimraf.sync(diffOutputPath);
+    yield rimrafFn(diffOutputPath);
 
     const defaultDiffConfig = {
       threshold: 0.01,
@@ -116,8 +135,8 @@ function diffImageToSnapshot(options) {
 
     const diffConfig = Object.assign({}, defaultDiffConfig, customDiffConfig);
 
-    const rawReceivedImage = PNG.sync.read(receivedImageBuffer);
-    const rawBaselineImage = PNG.sync.read(fs.readFileSync(baselineSnapshotPath));
+    const rawReceivedImage = yield pngReadFn(receivedImageBuffer);
+    const rawBaselineImage = yield pngReadFn(yield readFileFn(baselineSnapshotPath));
     const hasSizeMismatch = (
       rawReceivedImage.height !== rawBaselineImage.height ||
       rawReceivedImage.width !== rawBaselineImage.width
@@ -178,7 +197,7 @@ function diffImageToSnapshot(options) {
     }
 
     if (isFailure({ pass, updateSnapshot })) {
-      mkdirp.sync(diffDir);
+      yield mkdirpFn(diffDir);
       const composer = new ImageComposer({
         direction: diffDirection,
       });
@@ -203,8 +222,8 @@ function diffImageToSnapshot(options) {
       });
       // Set filter type to Paeth to avoid expensive auto scanline filter detection
       // For more information see https://www.w3.org/TR/PNG-Filters.html
-      const pngBuffer = PNG.sync.write(compositeResultImage, { filterType: 4 });
-      fs.writeFileSync(diffOutputPath, pngBuffer);
+      const pngBuffer = yield pngWriteFn(compositeResultImage, { filterType: 4 });
+      yield writeFileFn(diffOutputPath, pngBuffer);
 
       result = {
         pass: false,
@@ -216,8 +235,8 @@ function diffImageToSnapshot(options) {
         imgSrcString: `data:image/png;base64,${pngBuffer}`,
       };
     } else if (shouldUpdate({ pass, updateSnapshot, updatePassedSnapshot })) {
-      mkdirp.sync(snapshotsDir);
-      fs.writeFileSync(baselineSnapshotPath, receivedImageBuffer);
+      yield mkdirpFn(snapshotsDir);
+      yield writeFileFn(baselineSnapshotPath, receivedImageBuffer);
       result = { updated: true };
     } else {
       result = {
@@ -229,15 +248,9 @@ function diffImageToSnapshot(options) {
     }
   }
   return result;
-}
+});
 
-function runDiffImageToSnapshot(options) {
-  options.receivedImageBuffer = options.receivedImageBuffer.toString('base64');
-
-  const serializedInput = JSON.stringify(options);
-
-  let result = {};
-
+function spawnDiffProcessSync(serializedInput) {
   const writeDiffProcess = childProcess.spawnSync(
     process.execPath, [`${__dirname}/diff-process.js`],
     {
@@ -246,18 +259,56 @@ function runDiffImageToSnapshot(options) {
       maxBuffer: 10 * 1024 * 1024, // 10 MB
     }
   );
+  return {
+    status: writeDiffProcess.status,
+    output: writeDiffProcess.status === 0 && writeDiffProcess.output[3].toString(),
+  };
+}
 
-  if (writeDiffProcess.status === 0) {
-    const output = writeDiffProcess.output[3].toString();
+/* istanbul ignore next */
+function spawnDiffProcessAsync(serializedInput) {
+  return new Promise((resolve) => {
+    const spawnedAsync = childProcess.spawn(
+      process.execPath, [`${__dirname}/diff-process.js`],
+      {
+        stdio: ['pipe', 'inherit', 'inherit', 'pipe'],
+        maxBuffer: 10 * 1024 * 1024, // 10 MB
+      }
+    );
+
+    const output = getStream(spawnedAsync.stdio[3]);
+    Readable.from(serializedInput).pipe(spawnedAsync.stdin);
+    spawnedAsync.on('exit', async code => resolve({
+      status: code,
+      output: await output,
+    }));
+  });
+}
+
+const runDiffImageToSnapshot = yieldish(isSync => function* fn(options) {
+  /* istanbul ignore next */
+  const spawnFn = isSync ? spawnDiffProcessSync : spawnDiffProcessAsync;
+
+  options.receivedImageBuffer = options.receivedImageBuffer.toString('base64');
+
+  const serializedInput = JSON.stringify(options);
+
+  let result = {};
+
+  const { status, output } = yield spawnFn(serializedInput);
+
+  if (status === 0) {
     result = JSON.parse(output);
   } else {
     throw new Error('Error running image diff.');
   }
 
   return result;
-}
+});
 
 module.exports = {
-  diffImageToSnapshot,
-  runDiffImageToSnapshot,
+  diffImageToSnapshot: diffImageToSnapshot.sync,
+  diffImageToSnapshotAsync: diffImageToSnapshot.async,
+  runDiffImageToSnapshot: runDiffImageToSnapshot.sync,
+  runDiffImageToSnapshotAsync: runDiffImageToSnapshot.async,
 };

@@ -16,8 +16,11 @@ const kebabCase = require('lodash/kebabCase');
 const merge = require('lodash/merge');
 const path = require('path');
 const Chalk = require('chalk').constructor;
-const { diffImageToSnapshot, runDiffImageToSnapshot } = require('./diff-snapshot');
+const {
+  diffImageToSnapshot, diffImageToSnapshotAsync, runDiffImageToSnapshot, runDiffImageToSnapshotAsync,
+} = require('./diff-snapshot');
 const fs = require('fs');
+const { yieldish } = require('yieldish');
 
 const timesCalled = new Map();
 
@@ -134,7 +137,22 @@ function configureToMatchImageSnapshot({
   blur: commonBlur = 0,
   runInProcess: commonRunInProcess = false,
   dumpDiffToConsole: commonDumpDiffToConsole = false,
+  isSync = true,
 } = {}) {
+  let pendingExpectations;
+  if (!isSync) {
+    beforeEach(() => {
+      pendingExpectations = [];
+    });
+    afterEach(async () => {
+      const settled = await Promise.allSettled(pendingExpectations);
+      const errors = settled.filter(s => s.status === 'rejected').map(s => s.reason);
+      if (errors.length) {
+        throw new Error(errors.join('\n\n'));
+      }      
+    });
+  }
+
   return function toMatchImageSnapshot(received, {
     customSnapshotIdentifier = commonCustomSnapshotIdentifier,
     customSnapshotsDir = commonCustomSnapshotsDir,
@@ -181,36 +199,43 @@ function configureToMatchImageSnapshot({
       };
     }
 
-    const imageToSnapshot = runInProcess ? diffImageToSnapshot : runDiffImageToSnapshot;
+    const diffAndCheck = yieldish(yieldishIsSync => function* fn() {
+      const imageToSnapshotSync = runInProcess ? diffImageToSnapshot : runDiffImageToSnapshot;
+      const imageToSnapshotAsync = runInProcess ?
+        diffImageToSnapshotAsync :
+        runDiffImageToSnapshotAsync;
+      const imageToSnapshotFn = yieldishIsSync ? imageToSnapshotSync : imageToSnapshotAsync;
+      const result =
+        yield imageToSnapshotFn({
+          receivedImageBuffer: received,
+          snapshotsDir,
+          diffDir,
+          diffDirection,
+          snapshotIdentifier,
+          updateSnapshot: snapshotState._updateSnapshot === 'all',
+          customDiffConfig: Object.assign({}, commonCustomDiffConfig, customDiffConfig),
+          failureThreshold,
+          failureThresholdType,
+          updatePassedSnapshot,
+          blur,
+        });
 
-    const result =
-      imageToSnapshot({
-        receivedImageBuffer: received,
-        snapshotsDir,
-        diffDir,
-        diffDirection,
+      return checkResult({
+        result,
+        snapshotState,
+        retryTimes,
         snapshotIdentifier,
-        updateSnapshot: snapshotState._updateSnapshot === 'all',
-        customDiffConfig: Object.assign({}, commonCustomDiffConfig, customDiffConfig),
-        failureThreshold,
-        failureThresholdType,
-        updatePassedSnapshot,
-        blur,
+        chalk,
+        dumpDiffToConsole,
       });
-
-    return checkResult({
-      result,
-      snapshotState,
-      retryTimes,
-      snapshotIdentifier,
-      chalk,
-      dumpDiffToConsole,
     });
+    return isSync ? diffAndCheck.sync() : diffAndCheck.async();
   };
 }
 
 module.exports = {
   toMatchImageSnapshot: configureToMatchImageSnapshot(),
+  toMatchImageSnapshotAsync: configureToMatchImageSnapshot({ isSync: false }),
   configureToMatchImageSnapshot,
   updateSnapshotState,
 };
